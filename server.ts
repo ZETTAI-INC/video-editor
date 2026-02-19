@@ -57,6 +57,37 @@ app.post("/api/upload", upload.single("video"), (req, res) => {
     });
 });
 
+// Whisper API呼び出しヘルパー（SDKを使わず直接fetchで呼ぶ）
+async function whisperTranscribe(filePath: string, apiKey: string): Promise<{ text: string; segments: any[] }> {
+    const fileBuffer = fs.readFileSync(filePath);
+    const blob = new Blob([fileBuffer], { type: "audio/wav" });
+
+    const formData = new FormData();
+    formData.append("file", blob, path.basename(filePath));
+    formData.append("model", "whisper-1");
+    formData.append("language", "ja");
+    formData.append("response_format", "verbose_json");
+
+    const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+        method: "POST",
+        headers: {
+            Authorization: `Bearer ${apiKey}`,
+        },
+        body: formData,
+    });
+
+    if (!response.ok) {
+        const errorBody = await response.text();
+        throw new Error(`OpenAI API エラー (${response.status}): ${errorBody}`);
+    }
+
+    const data = await response.json() as any;
+    return {
+        text: data.text || "",
+        segments: data.segments || [],
+    };
+}
+
 // 音声文字起こしAPI（OpenAI Whisper API）
 app.post("/api/transcribe", async (req, res) => {
     const { filename } = req.body;
@@ -84,11 +115,9 @@ app.post("/api/transcribe", async (req, res) => {
             { stdio: "pipe" }
         );
 
-        const OpenAI = (await import("openai")).default;
-        const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
         const MAX_FILE_SIZE = 24 * 1024 * 1024; // 24MB（25MB制限に余裕を持たせる）
         const audioFileSize = fs.statSync(audioPath).size;
+        const apiKey = process.env.OPENAI_API_KEY;
 
         let subtitles: any[] = [];
         let text = "";
@@ -98,17 +127,10 @@ app.post("/api/transcribe", async (req, res) => {
             console.log(
                 `📝 OpenAI Whisper APIで文字起こし中... (${(audioFileSize / 1024 / 1024).toFixed(1)}MB)`
             );
-            const audioFile = fs.createReadStream(audioPath);
-            const response = await openai.audio.transcriptions.create({
-                model: "whisper-1",
-                file: audioFile,
-                language: "ja",
-                response_format: "verbose_json",
-            });
 
-            text = response.text || "";
-            const segments = (response as any).segments || [];
-            subtitles = segments.map((seg: any, i: number) => ({
+            const result = await whisperTranscribe(audioPath, apiKey);
+            text = result.text;
+            subtitles = result.segments.map((seg: any, i: number) => ({
                 index: i,
                 start: Math.round(seg.start * 100) / 100,
                 end: Math.round(seg.end * 100) / 100,
@@ -116,14 +138,12 @@ app.post("/api/transcribe", async (req, res) => {
             }));
         } else {
             // ── ファイルサイズが25MB超：分割してAPIに送信 ──
-            // 動画の長さを取得
             const durationStr = execSync(
                 `ffprobe -v error -show_entries format=duration -of csv=p=0 "${audioPath}"`,
                 { encoding: "utf-8" }
             ).trim();
             const totalDuration = parseFloat(durationStr);
 
-            // チャンク数を計算（各チャンクが24MB以下になるように）
             const numChunks = Math.ceil(audioFileSize / MAX_FILE_SIZE);
             const chunkDuration = Math.ceil(totalDuration / numChunks);
 
@@ -141,7 +161,6 @@ app.post("/api/transcribe", async (req, res) => {
                 const startTime = i * chunkDuration;
                 const chunkPath = path.join(chunkDir, `chunk_${i}.wav`);
 
-                // FFmpegでチャンクを切り出し
                 execSync(
                     `ffmpeg -y -i "${audioPath}" -ss ${startTime} -t ${chunkDuration} -acodec pcm_s16le -ar 16000 -ac 1 "${chunkPath}"`,
                     { stdio: "pipe" }
@@ -149,19 +168,10 @@ app.post("/api/transcribe", async (req, res) => {
 
                 console.log(`  📤 チャンク ${i + 1}/${numChunks} を送信中... (${startTime}秒〜)`);
 
-                const chunkFile = fs.createReadStream(chunkPath);
-                const response = await openai.audio.transcriptions.create({
-                    model: "whisper-1",
-                    file: chunkFile,
-                    language: "ja",
-                    response_format: "verbose_json",
-                });
+                const result = await whisperTranscribe(chunkPath, apiKey);
+                allTexts.push(result.text);
 
-                allTexts.push(response.text || "");
-                const segments = (response as any).segments || [];
-
-                // タイムスタンプにオフセットを加算
-                for (const seg of segments) {
+                for (const seg of result.segments) {
                     allSegments.push({
                         start: Math.round((seg.start + startTime) * 100) / 100,
                         end: Math.round((seg.end + startTime) * 100) / 100,
@@ -169,13 +179,10 @@ app.post("/api/transcribe", async (req, res) => {
                     });
                 }
 
-                // チャンクファイルを削除
                 fs.unlinkSync(chunkPath);
             }
 
-            // チャンクディレクトリを削除
             fs.rmdirSync(chunkDir);
-
             text = allTexts.join("");
             subtitles = allSegments.map((seg, i) => ({ index: i, ...seg }));
         }
