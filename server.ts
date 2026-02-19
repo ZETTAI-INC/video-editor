@@ -115,9 +115,8 @@ app.post("/api/transcribe", async (req, res) => {
     }
 
     if (!process.env.OPENAI_API_KEY) {
-        res.status(500).json({
-            error: "OPENAI_API_KEY が設定されていません。環境変数に OpenAI API キーを設定してください。",
-        });
+        console.log("⚠️ OPENAI_API_KEYが未設定のため、文字起こしをスキップします（プロジェクト読込で字幕を復元できます）");
+        res.json({ subtitles: [], text: "" });
         return;
     }
 
