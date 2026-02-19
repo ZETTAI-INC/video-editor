@@ -57,7 +57,7 @@ app.post("/api/upload", upload.single("video"), (req, res) => {
     });
 });
 
-// 音声文字起こしAPI（ローカルWhisper使用 - APIキー不要）
+// 音声文字起こしAPI（OpenAI Whisper API）
 app.post("/api/transcribe", async (req, res) => {
     const { filename } = req.body;
     if (!filename) {
@@ -65,12 +65,16 @@ app.post("/api/transcribe", async (req, res) => {
         return;
     }
 
+    if (!process.env.OPENAI_API_KEY) {
+        res.status(500).json({
+            error: "OPENAI_API_KEY が設定されていません。環境変数に OpenAI API キーを設定してください。",
+        });
+        return;
+    }
+
     const videoPath = path.join(__dirname, "public", filename);
-    const audioPath = path.join(
-        __dirname,
-        "public",
-        `${path.parse(filename).name}.wav`
-    );
+    const baseName = path.parse(filename).name;
+    const audioPath = path.join(__dirname, "public", `${baseName}.wav`);
 
     try {
         // 1. FFmpegで音声を抽出
@@ -80,22 +84,105 @@ app.post("/api/transcribe", async (req, res) => {
             { stdio: "pipe" }
         );
 
-        // 2. ローカルWhisperで文字起こし（APIキー不要）
-        console.log("📝 ローカルWhisperで文字起こし中...(初回はモデルダウンロードがあります)");
-        const scriptPath = path.join(__dirname, "transcribe.py");
-        const result = execSync(
-            `python3 "${scriptPath}" "${audioPath}" large`,
-            { encoding: "utf-8", maxBuffer: 50 * 1024 * 1024, timeout: 300000 }
-        );
+        const OpenAI = (await import("openai")).default;
+        const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-        const transcription = JSON.parse(result.trim());
+        const MAX_FILE_SIZE = 24 * 1024 * 1024; // 24MB（25MB制限に余裕を持たせる）
+        const audioFileSize = fs.statSync(audioPath).size;
 
-        if (transcription.error) {
-            throw new Error(transcription.error);
+        let subtitles: any[] = [];
+        let text = "";
+
+        if (audioFileSize <= MAX_FILE_SIZE) {
+            // ── ファイルサイズが25MB以下：そのままAPIに送信 ──
+            console.log(
+                `📝 OpenAI Whisper APIで文字起こし中... (${(audioFileSize / 1024 / 1024).toFixed(1)}MB)`
+            );
+            const audioFile = fs.createReadStream(audioPath);
+            const response = await openai.audio.transcriptions.create({
+                model: "whisper-1",
+                file: audioFile,
+                language: "ja",
+                response_format: "verbose_json",
+                timestamp_granularities: ["segment"],
+            });
+
+            text = response.text || "";
+            const segments = (response as any).segments || [];
+            subtitles = segments.map((seg: any, i: number) => ({
+                index: i,
+                start: Math.round(seg.start * 100) / 100,
+                end: Math.round(seg.end * 100) / 100,
+                text: seg.text.trim(),
+            }));
+        } else {
+            // ── ファイルサイズが25MB超：分割してAPIに送信 ──
+            // 動画の長さを取得
+            const durationStr = execSync(
+                `ffprobe -v error -show_entries format=duration -of csv=p=0 "${audioPath}"`,
+                { encoding: "utf-8" }
+            ).trim();
+            const totalDuration = parseFloat(durationStr);
+
+            // チャンク数を計算（各チャンクが24MB以下になるように）
+            const numChunks = Math.ceil(audioFileSize / MAX_FILE_SIZE);
+            const chunkDuration = Math.ceil(totalDuration / numChunks);
+
+            console.log(
+                `📝 音声ファイルが大きいため ${numChunks} 分割してAPIに送信します (${(audioFileSize / 1024 / 1024).toFixed(1)}MB, ${totalDuration.toFixed(1)}秒)`
+            );
+
+            const chunkDir = path.join(__dirname, "public", `${baseName}_chunks`);
+            if (!fs.existsSync(chunkDir)) fs.mkdirSync(chunkDir, { recursive: true });
+
+            const allSegments: any[] = [];
+            const allTexts: string[] = [];
+
+            for (let i = 0; i < numChunks; i++) {
+                const startTime = i * chunkDuration;
+                const chunkPath = path.join(chunkDir, `chunk_${i}.wav`);
+
+                // FFmpegでチャンクを切り出し
+                execSync(
+                    `ffmpeg -y -i "${audioPath}" -ss ${startTime} -t ${chunkDuration} -acodec pcm_s16le -ar 16000 -ac 1 "${chunkPath}"`,
+                    { stdio: "pipe" }
+                );
+
+                console.log(`  📤 チャンク ${i + 1}/${numChunks} を送信中... (${startTime}秒〜)`);
+
+                const chunkFile = fs.createReadStream(chunkPath);
+                const response = await openai.audio.transcriptions.create({
+                    model: "whisper-1",
+                    file: chunkFile,
+                    language: "ja",
+                    response_format: "verbose_json",
+                    timestamp_granularities: ["segment"],
+                });
+
+                allTexts.push(response.text || "");
+                const segments = (response as any).segments || [];
+
+                // タイムスタンプにオフセットを加算
+                for (const seg of segments) {
+                    allSegments.push({
+                        start: Math.round((seg.start + startTime) * 100) / 100,
+                        end: Math.round((seg.end + startTime) * 100) / 100,
+                        text: seg.text.trim(),
+                    });
+                }
+
+                // チャンクファイルを削除
+                fs.unlinkSync(chunkPath);
+            }
+
+            // チャンクディレクトリを削除
+            fs.rmdirSync(chunkDir);
+
+            text = allTexts.join("");
+            subtitles = allSegments.map((seg, i) => ({ index: i, ...seg }));
         }
 
-        const subtitles = transcription.subtitles || [];
-        console.log(`✅ ${subtitles.length}個のセグメントを検出`);
+        console.log(`✅ OpenAI Whisper API: ${subtitles.length}個のセグメントを検出`);
 
         // 一時的な音声ファイルを削除
         fs.unlinkSync(audioPath);
@@ -104,13 +191,17 @@ app.post("/api/transcribe", async (req, res) => {
         const subtitlePath = path.join(
             __dirname,
             "public",
-            `${path.parse(filename).name}_subtitles.json`
+            `${baseName}_subtitles.json`
         );
         fs.writeFileSync(subtitlePath, JSON.stringify(subtitles, null, 2));
 
-        res.json({ subtitles, text: transcription.text });
+        res.json({ subtitles, text });
     } catch (error: any) {
-        console.error("❌ エラー:", error.message);
+        console.error("❌ 文字起こしエラー:", error.message);
+        // 一時ファイルのクリーンアップ
+        if (fs.existsSync(audioPath)) {
+            try { fs.unlinkSync(audioPath); } catch { }
+        }
         res.status(500).json({ error: error.message });
     }
 });

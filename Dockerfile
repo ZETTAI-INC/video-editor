@@ -1,25 +1,10 @@
 FROM node:20-slim
 
-# Install system dependencies: FFmpeg, Python3, pip
+# Install FFmpeg only (Whisper handled via OpenAI API)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    python3 \
-    python3-pip \
-    python3-venv \
-    && rm -rf /var/lib/apt/lists/*
-
-# Create Python venv and install Whisper
-RUN python3 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-RUN pip install --no-cache-dir openai-whisper
-
-# Install Chromium for Remotion rendering
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    chromium \
     fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
-
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 WORKDIR /app
 
