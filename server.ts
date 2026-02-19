@@ -409,8 +409,8 @@ app.post("/api/render", async (req, res) => {
         const { execSync } = await import("child_process");
         const propsJson = JSON.stringify({ videoFileName: filename });
         execSync(
-            `npx remotion render MyComp "${outputPath}" --codec=h264 --props='${propsJson}'`,
-            { cwd: __dirname, stdio: "inherit", timeout: 600000 }
+            `npx remotion render MyComp "${outputPath}" --codec=h264 --concurrency=1 --gl=angle --props='${propsJson}'`,
+            { cwd: __dirname, stdio: "inherit", timeout: 1800000 }
         );
         console.log(`✅ レンダリング完了: ${relOutput}`);
         res.json({ success: true, path: relOutput, filename: `${baseName}_rendered.mp4` });
