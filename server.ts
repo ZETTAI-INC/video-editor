@@ -59,24 +59,39 @@ app.post("/api/upload", upload.single("video"), (req, res) => {
 
 // Whisper API呼び出しヘルパー（curlで直接呼ぶ — 最も確実な方法）
 function whisperTranscribe(filePath: string, apiKey: string): { text: string; segments: any[] } {
-    const result = execSync(
-        `curl -s -X POST https://api.openai.com/v1/audio/transcriptions \
-         -H "Authorization: Bearer ${apiKey}" \
-         -F "file=@${filePath}" \
-         -F "model=whisper-1" \
-         -F "language=ja" \
-         -F "response_format=verbose_json"`,
-        { encoding: "utf-8", maxBuffer: 50 * 1024 * 1024, timeout: 600000 }
-    );
+    try {
+        const result = execSync(
+            `curl -s --connect-timeout 30 --max-time 300 ` +
+            `-X POST https://api.openai.com/v1/audio/transcriptions ` +
+            `-H "Authorization: Bearer ${apiKey}" ` +
+            `-F "file=@${filePath}" ` +
+            `-F "model=whisper-1" ` +
+            `-F "language=ja" ` +
+            `-F "response_format=verbose_json"`,
+            { encoding: "utf-8", maxBuffer: 50 * 1024 * 1024, timeout: 600000 }
+        );
 
-    const data = JSON.parse(result);
-    if (data.error) {
-        throw new Error(`OpenAI API エラー: ${JSON.stringify(data.error)}`);
+        if (!result || result.trim() === "") {
+            throw new Error("APIからの応答が空です");
+        }
+
+        console.log("📥 API応答受信 (先頭100文字):", result.substring(0, 100));
+
+        const data = JSON.parse(result);
+        if (data.error) {
+            throw new Error(`OpenAI APIエラー: ${data.error.message || JSON.stringify(data.error)}`);
+        }
+        return {
+            text: data.text || "",
+            segments: data.segments || [],
+        };
+    } catch (err: any) {
+        // APIキーをエラーメッセージから除去
+        const rawMsg = err.stderr?.toString() || err.message || "不明なエラー";
+        const safeMsg = rawMsg.replace(/Bearer [^\s"]+/g, "Bearer [HIDDEN]").replace(/sk-[^\s"]+/g, "[API_KEY_HIDDEN]");
+        console.error("❌ Whisper API呼び出し失敗:", safeMsg);
+        throw new Error(`文字起こしに失敗しました: ${safeMsg}`);
     }
-    return {
-        text: data.text || "",
-        segments: data.segments || [],
-    };
 }
 
 // 音声文字起こしAPI（OpenAI Whisper API）
