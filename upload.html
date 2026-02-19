@@ -2275,7 +2275,7 @@
       document.getElementById(panelMap[tabName]).classList.add('active');
     }
 
-    const SERVER = "http://localhost:3001";
+    const SERVER = window.location.origin;
     let currentFilename = "";
     let currentSubtitles = [];
     let currentStyle = {
